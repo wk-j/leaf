@@ -711,6 +711,8 @@ impl App {
         let Some(line) = laid.rows.get(row - prefix) else { return };
         let highlights: Vec<&Highlight> = self.highlights.iter().filter(|h| h.page == page).collect();
         let buf = f.buffer_mut();
+        // The cell of the last letter drawn, which the combining marks after it join.
+        let mut letter: Option<u16> = None;
         for seg in &line.segs {
             let mut x = column.x + seg.x;
             for (i, c) in seg.text.chars().enumerate() {
@@ -728,10 +730,19 @@ impl App {
                         style = style.bg(SELECTION).fg(Color::Reset);
                     }
                 }
+                let width = char_width(c);
                 if x < column.right() {
-                    buf.set_string(x, y, c.to_string(), style);
+                    if width > 0 {
+                        buf.set_string(x, y, c.to_string(), style);
+                        letter = Some(x);
+                    } else if let Some(at) = letter {
+                        // A mark with no width of its own (a Thai vowel or tone mark) is drawn in its letter's cell.
+                        let cell = &mut buf[(at, y)];
+                        let symbol = format!("{}{c}", cell.symbol());
+                        cell.set_symbol(&symbol);
+                    }
                 }
-                x += char_width(c);
+                x += width;
             }
         }
     }
@@ -1145,8 +1156,9 @@ impl App {
             for seg in &segs {
                 let mut sx = seg.x;
                 for (n, c) in seg.text.chars().enumerate() {
-                    let w = char_width(c).max(1);
-                    if col < sx + w {
+                    let w = char_width(c);
+                    // A mark with no width shares its letter's cell, so the letter is what's pointed at.
+                    if w > 0 && col < sx + w {
                         return seg.offset.map(|o| TextPos { page: slot.page, offset: o + n });
                     }
                     sx += w;
@@ -1545,6 +1557,18 @@ mod tests {
         s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
         s.press(KeyCode::Char('y'));
         assert!(saved.borrow().is_empty());
+    }
+
+    #[test]
+    fn thai_marks_sit_on_their_letters_and_select_with_them() {
+        let mut s = Screen::new(book(&["Pick ที่นี่ now"]), 120, 30, ViewerOptions::default());
+        let (x, y) = s.find("Pick");
+        assert_eq!(s.terminal.backend().buffer()[(x + 5, y)].symbol(), "ที่");
+        assert_eq!(s.terminal.backend().buffer()[(x + 6, y)].symbol(), "นี่");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 5, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 7, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 7, y);
+        assert_eq!(s.app.copy.as_deref(), Some("ที่นี่"));
     }
 
     #[test]

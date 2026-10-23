@@ -71,6 +71,12 @@ pub fn width(text: &str) -> usize {
     render(text)[0].chars().count()
 }
 
+/// Whether the font has every letter and digit of `text`. A heading in
+/// another script, or with accented letters, would lose them to blank space.
+pub fn spells(text: &str) -> bool {
+    text.chars().filter(|c| c.is_alphanumeric()).all(|c| glyph(c).is_some())
+}
+
 /// The two rows of `text` set in the font.
 pub fn render(text: &str) -> [String; 2] {
     let mut rows = [String::new(), String::new()];

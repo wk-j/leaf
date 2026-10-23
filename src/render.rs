@@ -524,8 +524,8 @@ impl Ctx<'_> {
     fn heading(&mut self, depth: u8, runs: &[Run], x: u16, width: u16, align: Align) {
         let text: String = runs.iter().map(|r| r.text.as_str()).collect();
         // The terminal has one font size, so rank comes from size where it fits
-        // (large letters for a short title), then weight and space.
-        if depth == 1 && font::width(&text) <= width as usize {
+        // (large letters for a short title the block font can spell), then weight and space.
+        if depth == 1 && font::spells(&text) && font::width(&text) <= width as usize {
             let w = font::width(&text) as u16;
             let x = if align == Align::Center { x + (width - w) / 2 } else { x };
             for row in font::render(&text) {
@@ -830,8 +830,14 @@ fn wrap_cells(cells: &[Cell], width: u16, wrap: Wrap) -> Vec<Vec<Cell>> {
                         for &cell in word {
                             let w = char_width(cell.0);
                             if used + w > width && !line.is_empty() {
+                                // A Thai leading vowel is written before its consonant; they wrap together.
+                                let carried = if line.len() > 1 && line.last().is_some_and(|c| is_thai_leading_vowel(c.0)) { line.pop() } else { None };
                                 lines.push(std::mem::take(&mut line));
                                 used = 0;
+                                if let Some(vowel) = carried {
+                                    line.push(vowel);
+                                    used += char_width(vowel.0);
+                                }
                             }
                             line.push(cell);
                             used += w;
@@ -846,6 +852,10 @@ fn wrap_cells(cells: &[Cell], width: u16, wrap: Wrap) -> Vec<Vec<Cell>> {
         lines.push(line);
     }
     lines
+}
+
+fn is_thai_leading_vowel(c: char) -> bool {
+    ('\u{0E40}'..='\u{0E44}').contains(&c)
 }
 
 /// Groups a line's cells into same-styled segments starting at column `x`.
@@ -917,6 +927,17 @@ mod tests {
     #[test]
     fn paragraphs_wrap_at_words_with_a_blank_row_below() {
         assert_eq!(draw("one two three four", 9), vec!["one two", "three", "four", ""]);
+    }
+
+    #[test]
+    fn a_title_the_block_font_cant_spell_is_set_in_plain_letters() {
+        let rows = draw("# ทดสอบภาษาไทย\n\nText", 40);
+        assert!(rows.iter().any(|r| r == "ทดสอบภาษาไทย"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_thai_run_too_long_for_a_row_breaks_before_a_leading_vowel_not_after() {
+        assert_eq!(draw("กกกกไว้", 5), vec!["กกกก", "ไว้", ""]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use image::RgbaImage;
 use mupdf::{
-    ColorParams, Colorspace, Device, Document, IRect, Matrix, MetadataName, Page, Pixmap, TextPageFlags,
+    ColorParams, Colorspace, Device, Document, IRect, Matrix, MetadataName, Page, Pixmap, TextChar, TextPage, TextPageFlags,
     text_page::TextBlockType,
 };
 use regex::Regex;
@@ -183,7 +183,13 @@ fn block_size(lines: &[Line]) -> f32 {
 }
 
 fn block_text(lines: &[Line]) -> String {
-    let joined = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
+    let mut joined = String::new();
+    let mut before = "";
+    for line in lines {
+        joined.push_str(line_joiner(before, &line.text));
+        joined.push_str(&line.text);
+        before = &line.text;
+    }
     SPACES.replace_all(&joined, " ").trim().to_owned()
 }
 
@@ -196,11 +202,25 @@ fn starts_with(text: &str, test: impl Fn(char) -> bool) -> bool {
     text.chars().next().is_some_and(test)
 }
 
-/// Joins wrapped lines into a paragraph, undoing end-of-line hyphenation and mending URLs.
+fn is_thai(c: char) -> bool {
+    ('\u{0E01}'..='\u{0E5B}').contains(&c)
+}
+
+/// What goes between a line and the next. Thai runs words together and
+/// spaces only between phrases, so a line wrapped between two Thai words
+/// carries on without a space; one that ended in a space ended a phrase.
+fn line_joiner(before: &str, after: &str) -> &'static str {
+    if before.chars().next_back().is_some_and(is_thai) && after.chars().next().is_some_and(is_thai) { "" } else { " " }
+}
+
+/// Joins wrapped lines into a paragraph, undoing end-of-line hyphenation and
+/// mending URLs. Lines keep their trailing space for `line_joiner`.
 fn join_lines<S: AsRef<str>>(lines: &[S]) -> String {
     let mut acc = String::new();
-    for line in lines {
-        let line = line.as_ref();
+    let mut before = "";
+    for raw in lines {
+        let raw = raw.as_ref();
+        let line = raw.trim_end();
         let mends_url = URL_BREAK.is_match(&acc) && starts_with(line, |c| c.is_ascii_lowercase() || c.is_ascii_digit());
         if acc.is_empty() || mends_url {
             acc.push_str(line);
@@ -208,9 +228,10 @@ fn join_lines<S: AsRef<str>>(lines: &[S]) -> String {
             acc.pop();
             acc.push_str(line);
         } else {
-            acc.push(' ');
+            acc.push_str(line_joiner(before, line));
             acc.push_str(line);
         }
+        before = raw;
     }
     acc
 }
@@ -257,7 +278,7 @@ impl Marker {
 /// that opens with the same kind of marker starts a new item. The flag tells
 /// the caller to keep it tight against neighbouring list items.
 fn paragraph_markdown(lines: &[Line]) -> (String, bool) {
-    let texts: Vec<&str> = lines.iter().map(|l| l.text.trim()).filter(|t| !t.is_empty()).collect();
+    let texts: Vec<&str> = lines.iter().map(|l| l.text.trim_start()).filter(|t| !t.is_empty()).collect();
     let first = texts.first().copied().unwrap_or("");
     let marker = if BULLET.is_match(first) {
         Some(Marker::Bullet)
@@ -473,7 +494,7 @@ fn columns_of<'a>(rows: impl IntoIterator<Item = &'a Vec<Line>>) -> Vec<f32> {
 }
 
 fn cell_text(lines: &[Line]) -> String {
-    let texts: Vec<&str> = lines.iter().map(|l| l.text.trim()).collect();
+    let texts: Vec<&str> = lines.iter().map(|l| l.text.trim_start()).collect();
     let text = join_lines(&texts).replace('|', "\\|");
     if !text.is_empty() && lines.iter().all(|l| l.bold) { format!("**{text}**") } else { text }
 }
@@ -983,12 +1004,83 @@ fn render_region(page: &Page, region: Region, width: u32) -> Result<Option<RgbaI
     Ok(rgba(&pixmap))
 }
 
-/// Reads one page into blocks, registering the images it shows.
-fn read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, PdfImage>>) -> Result<Vec<Block>, mupdf::Error> {
+/// Word writes Thai SARA AM, in fonts such as TH Sarabun, as a NIKHAHIT glyph
+/// then a SARA AA glyph, and maps the NIKHAHIT to a space that takes no room,
+/// so "ดำเนิน" reads "ด าเนิน". Some of those fonts also map the SARA AA glyph
+/// to SARA AM, so "การ" reads "กำร" and a SARA AM reads as the empty space and
+/// a SARA AM; that pair gives such a font away. Builds a line's text, mending both.
+#[derive(Default)]
+struct LineText {
+    text: String,
+    /// The last character was a space that takes no room: a NIKHAHIT, if a SARA AA or SARA AM follows.
+    nikhahit: bool,
+}
+
+impl LineText {
+    /// `no_room`: `ch` is a space that takes no room. `aa_as_am`: `ch` is in a font that maps SARA AA to SARA AM.
+    fn push(&mut self, ch: char, no_room: bool, aa_as_am: bool) {
+        if std::mem::take(&mut self.nikhahit) {
+            if matches!(ch, 'า' | 'ำ') {
+                self.text.push('ำ');
+                return;
+            }
+            self.text.push(' ');
+        }
+        if ch == ' ' && no_room {
+            self.nikhahit = true;
+        } else {
+            self.text.push(if ch == 'ำ' && aa_as_am { 'า' } else { ch });
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.nikhahit {
+            self.text.push(' ');
+        }
+        self.text
+    }
+}
+
+fn takes_no_room(c: &TextChar) -> bool {
+    let q = c.quad();
+    (q.ur.x - q.ul.x).hypot(q.ur.y - q.ul.y) < 0.01
+}
+
+/// Adds the fonts on a page that map SARA AA to SARA AM (see `LineText`) to `aa_as_am`.
+fn learn_aa_as_am(text_page: &TextPage, aa_as_am: &mut HashSet<String>) {
+    for block in text_page.blocks().filter(|b| b.r#type() == TextBlockType::Text) {
+        for line in block.lines() {
+            let mut nikhahit = false;
+            for c in line.chars() {
+                let ch = c.char();
+                if nikhahit
+                    && ch == Some('ำ')
+                    && let Some(font) = c.font()
+                    && !aa_as_am.contains(font.name())
+                {
+                    aa_as_am.insert(font.name().to_owned());
+                }
+                nikhahit = ch == Some(' ') && takes_no_room(&c);
+            }
+        }
+    }
+}
+
+/// Reads one page into blocks, registering the images it shows. Fonts found
+/// to map SARA AA to SARA AM join `aa_as_am`, which is kept for the whole
+/// document: a font often gives itself away on only some of its pages.
+fn read_page(
+    document: &Document,
+    i: usize,
+    images: &RefCell<HashMap<String, PdfImage>>,
+    aa_as_am: &RefCell<HashSet<String>>,
+) -> Result<Vec<Block>, mupdf::Error> {
     let page = document.load_page(i as i32)?;
     let bounds = page.bounds()?;
     let (width, height) = ((bounds.x1 - bounds.x0).max(1.0), (bounds.y1 - bounds.y0).max(1.0));
     let text_page = page.to_text_page(TextPageFlags::PRESERVE_IMAGES)?;
+    let mut aa_as_am = aa_as_am.borrow_mut();
+    learn_aa_as_am(&text_page, &mut aa_as_am);
 
     // Each block with its top edge, so drawings can go where they sit on the page.
     enum Raw {
@@ -1002,17 +1094,19 @@ fn read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, Pdf
             TextBlockType::Text => {
                 let mut lines = Vec::new();
                 for line in block.lines() {
-                    let mut text = String::new();
+                    let mut text = LineText::default();
                     let (mut mono, mut all) = (0usize, 0usize);
                     let mut style: Option<(f32, String, bool, bool)> = None;
                     for c in line.chars() {
                         let Some(ch) = c.char() else { continue };
-                        text.push(ch);
+                        let font = if ch.is_whitespace() { None } else { c.font() };
+                        let in_aa_as_am = ch == 'ำ' && font.as_ref().is_some_and(|f| aa_as_am.contains(f.name()));
+                        text.push(ch, ch == ' ' && takes_no_room(&c), in_aa_as_am);
                         if ch.is_whitespace() {
                             continue;
                         }
                         all += 1;
-                        if let Some(font) = c.font() {
+                        if let Some(font) = font {
                             if font.is_monospaced() || MONO_FONT_NAME.is_match(font.name()) {
                                 mono += 1;
                             }
@@ -1021,6 +1115,7 @@ fn read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, Pdf
                             }
                         }
                     }
+                    let text = text.finish();
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -1107,8 +1202,8 @@ fn embedded_image(document: &Document, page: usize, block: usize) -> Result<Opti
 }
 
 /// One malformed page must not lose the whole document: note it and keep going.
-fn safe_read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, PdfImage>>) -> Vec<Block> {
-    read_page(document, i, images).unwrap_or_else(|e| {
+fn safe_read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, PdfImage>>, aa_as_am: &RefCell<HashSet<String>>) -> Vec<Block> {
+    read_page(document, i, images, aa_as_am).unwrap_or_else(|e| {
         vec![Block::Note(format!("Page {} could not be read ({e}). The other pages are unaffected.", i + 1))]
     })
 }
@@ -1122,6 +1217,8 @@ struct PdfSource {
     /// Markdown of pages read lately, so turning back and forth reads nothing twice.
     pages: RefCell<HashMap<usize, Rc<str>>>,
     images: RefCell<HashMap<String, PdfImage>>,
+    /// Fonts that map Thai SARA AA to SARA AM, learned from the pages read so far.
+    aa_as_am: RefCell<HashSet<String>>,
 }
 
 impl PdfSource {
@@ -1136,7 +1233,7 @@ impl PdfSource {
             }
         }
         document.1 += 1;
-        safe_read_page(&document.0, index, &self.images)
+        safe_read_page(&document.0, index, &self.images, &self.aa_as_am)
     }
 
     /// Forgets the page furthest from `index` once too many are kept, and its images.
@@ -1235,7 +1332,10 @@ fn from_document(
     let document = document.map_err(failed)?;
     let page_count = document.page_count().map_err(failed)?.max(0) as usize;
     let images = RefCell::new(HashMap::new());
-    let sample: Vec<Vec<Block>> = sample_pages(page_count, SAMPLE_PAGES).into_iter().map(|i| safe_read_page(&document, i, &images)).collect();
+    // The sample spreads through the document, so it finds most fonts that map SARA AA to SARA AM before any page shows.
+    let aa_as_am = RefCell::new(HashSet::new());
+    let sample: Vec<Vec<Block>> =
+        sample_pages(page_count, SAMPLE_PAGES).into_iter().map(|i| safe_read_page(&document, i, &images, &aa_as_am)).collect();
     let layout = analyze(&sample);
     // What the sample pages loaded is no use to the page the reader opens on.
     memory::shrink_mupdf_cache(0);
@@ -1243,7 +1343,14 @@ fn from_document(
     Ok(Doc {
         title: title.unwrap_or_else(|| fallback_title.to_owned()),
         page_count: Some(page_count),
-        source: Box::new(PdfSource { path, document: RefCell::new((document, 0)), layout, pages: RefCell::new(HashMap::new()), images }),
+        source: Box::new(PdfSource {
+            path,
+            document: RefCell::new((document, 0)),
+            layout,
+            pages: RefCell::new(HashMap::new()),
+            images,
+            aa_as_am,
+        }),
     })
 }
 
@@ -1517,5 +1624,38 @@ mod tests {
         let out = md(vec![body(0.0), item("Strings", 70.0), item("Lists", 90.0)]);
         assert!(out.contains("- Strings
 - Lists"), "{out}");
+    }
+
+    #[test]
+    fn thai_lines_wrapped_mid_phrase_join_without_a_space() {
+        // Thai spaces only between phrases, so only a line that ends in a space ends one.
+        let out = md(vec![
+            text(vec![sized("ภาพรวมของ", 0.0, 20.0, true)]),
+            text(vec![sized("สถาปัตยกรรมระบบ", 22.0, 20.0, true)]),
+            text(vec![
+                line("ภาษาไทยมีวรรณยุกต์ที่วางอยู่เหนือ", 60.0),
+                line("และใต้ตัวอักษร การแสดงผล ", 72.0),
+                line("เพื่อให้อ่านได้ครบ", 84.0),
+            ]),
+        ]);
+        assert!(out.starts_with("# ภาพรวมของสถาปัตยกรรมระบบ\n\n"), "{out}");
+        assert!(out.ends_with("ภาษาไทยมีวรรณยุกต์ที่วางอยู่เหนือและใต้ตัวอักษร การแสดงผล เพื่อให้อ่านได้ครบ"), "{out}");
+    }
+
+    #[test]
+    fn word_thai_sara_am_written_as_two_glyphs_is_mended() {
+        // '_' stands for a space that takes no room.
+        let read = |chars: &str, aa_as_am: bool| {
+            let mut text = LineText::default();
+            for c in chars.chars() {
+                text.push(if c == '_' { ' ' } else { c }, c == '_', aa_as_am);
+            }
+            text.finish()
+        };
+        assert_eq!(read("ขอบเขตการด_าเนินงาน", false), "ขอบเขตการดำเนินงาน");
+        // In a font that maps SARA AA to SARA AM, a lone SARA AM is a SARA AA.
+        assert_eq!(read("บทน_ำ หลักกำร", true), "บทนำ หลักการ");
+        assert_eq!(read("คำนำ", false), "คำนำ");
+        assert_eq!(read("a_b_", false), "a b ");
     }
 }
